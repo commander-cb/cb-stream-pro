@@ -430,7 +430,7 @@ void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) 
 //------------------------------------------------------------------------------
 void recordingThread(int width, int height) {
     // Set your Twitch RTMP URL (with your stream key)
-    const char* rtmpUrl = "rtmp://live.twitch.tv/app/live_839259386_1LoEwIC6GVNG84QQKjwU6axAfNt1IY";
+    const char* rtmpUrl = "rtm----------------your   twitch     key   in      here       ---    t1IY";
     
     // Obtain audio mix format from WASAPI.
     HRESULT hr;
