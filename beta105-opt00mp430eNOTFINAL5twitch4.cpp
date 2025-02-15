@@ -4,7 +4,7 @@
 //   $ g++ -std=c++17 -o beta105-opt00mp430eNOTFINAL5twitch3.exe beta105-opt00mp430eNOTFINAL5twitch3.cpp     -I"C:/msys64/mingw64/include"     -L"C:/msys64/mingw64/lib"     -lavcodec -lavformat -lavutil -lswscale     -lgdi32 -luser32 -lole32 -lswresample
 
 // Required defines & includes
-//   
+//   beta105-opt00mp430eNOTFINAL5twitch3.exe
 
 
 

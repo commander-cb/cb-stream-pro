@@ -8,7 +8,6 @@
 
 
 
-
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -22,6 +21,7 @@
 #include <queue>
 #include <condition_variable>
 #include <mutex>
+#include <vector>
 #include <ctime>
 #pragma comment(lib, "Ole32.lib")
 
@@ -46,13 +46,13 @@ std::condition_variable cv;
 // VIDEO CAPTURE CODE
 //------------------------------------------------------------------------------
 
-// Structure for a captured frame
+// Updated structure for a captured frame using a vector.
 struct CapturedFrame {
-    uint8_t* data;
-    int64_t timestamp; // microseconds
+    std::vector<uint8_t> data; // RGBA pixel data
+    int64_t timestamp;         // microseconds
 };
 
-// A simple frame buffer for captured video frames
+// A simple frame buffer for captured video frames.
 class FrameBuffer {
 private:
     std::queue<CapturedFrame*> bufferQueue;
@@ -65,8 +65,7 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
         if (bufferQueue.size() >= maxSize) {
             CapturedFrame* oldFrame = bufferQueue.front();
-            delete[] oldFrame->data;
-            delete oldFrame;
+            delete oldFrame; // vector cleans up its memory automatically.
             bufferQueue.pop();
         }
         bufferQueue.push(frame);
@@ -136,7 +135,9 @@ bool initializeVideoEncoder(AVFormatContext* fmtCtx, AVCodecContext** codecConte
     }
     (*codecContext)->width = width;
     (*codecContext)->height = height;
-    (*codecContext)->time_base = {1, 1000000}; // microsecond resolution
+//    (*codecContext)->time_base = {1, 1000000}; // microsecond resolution 4 SCREEN RECORDER
+(*codecContext)->time_base = {1, 1000}; // use milliseconds for FLV
+
     (*codecContext)->framerate = {30, 1};        // 30 FPS
     (*codecContext)->pkt_timebase = {1, 1000000};
     (*codecContext)->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -183,14 +184,13 @@ bool initializeAudioEncoder(AVFormatContext* fmtCtx, AVCodecContext** audioCodec
     }
     (*audioCodecCtx)->sample_rate = wfx->nSamplesPerSec;
     
-    // Set up channel layout using the new ch_layout field.
+    // Set up channel layout.
     av_channel_layout_default(&(*audioCodecCtx)->ch_layout, wfx->nChannels);
     if (wfx->nChannels == 1) {
         av_channel_layout_from_mask(&(*audioCodecCtx)->ch_layout, AV_CH_LAYOUT_MONO);
     } else if (wfx->nChannels == 2) {
         av_channel_layout_from_mask(&(*audioCodecCtx)->ch_layout, AV_CH_LAYOUT_STEREO);
     }
-    // For more channels, the default layout is already set.
     
     (*audioCodecCtx)->sample_fmt = AV_SAMPLE_FMT_FLTP; // AAC expects planar float
     (*audioCodecCtx)->bit_rate = 128000; // 128 kbps example
@@ -238,6 +238,7 @@ bool initializeFFmpeg(AVFormatContext** formatContext, AVCodecContext** videoCod
 //------------------------------------------------------------------------------
 // AUDIO CAPTURE VIA WASAPI (system audio, loopback)
 //------------------------------------------------------------------------------
+// This version accumulates converted audio samples until 1024 samples per channel are available.
 void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) {
     // Initialize WASAPI for loopback capture.
     HRESULT hr;
@@ -291,14 +292,21 @@ void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) 
         &audioCodecCtx->ch_layout,            // destination channel layout
         audioCodecCtx->sample_fmt,              // destination sample format
         audioCodecCtx->sample_rate,             // destination sample rate
-        &src_layout,                          // source channel layout
+        &src_layout,                           // source channel layout
         (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ? AV_SAMPLE_FMT_FLT : AV_SAMPLE_FMT_S16, // source format
         pwfx->nSamplesPerSec,                   // source sample rate
         0, nullptr);
     if (ret < 0 || !swr_ctx) {
-        std::cerr << "Audio: Could not initialize resampler.\n";
+        std::cerr << "Audio: Could not allocate resampler.\n";
         swr_free(&swr_ctx);
-        // You might choose to continue without conversion if formats match.
+        // Optionally continue if formats match.
+    } else {
+        ret = swr_init(swr_ctx);
+        if (ret < 0) {
+            std::cerr << "Audio: Failed to initialize the resampler context.\n";
+            swr_free(&swr_ctx);
+            swr_ctx = nullptr;
+        }
     }
     
     // Initialize audio client for loopback capture.
@@ -343,6 +351,11 @@ void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) 
     AVPacket* packet = av_packet_alloc();
     int64_t audioPts = 0;
     
+    // Prepare per-channel accumulation buffers (for planar float data)
+    int numChannels = audioCodecCtx->ch_layout.nb_channels;
+    std::vector<std::vector<float>> audioAcc(numChannels);
+    
+    // Main audio capture loop.
     while (isRecording) {
         UINT32 packetLength = 0;
         hr = pCaptureClient->GetNextPacketSize(&packetLength);
@@ -360,6 +373,7 @@ void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) 
             int bytesPerFrame = pwfx->nBlockAlign;
             int dataSize = numFramesAvailable * bytesPerFrame;
             
+            // Allocate a temporary frame for conversion.
             AVFrame* frame = av_frame_alloc();
             frame->nb_samples = numFramesAvailable;
             frame->ch_layout = audioCodecCtx->ch_layout;
@@ -371,25 +385,27 @@ void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) 
                 break;
             }
             
+            // Convert captured data.
             if (swr_ctx) {
                 const uint8_t* inData[1] = { pData };
                 int convRet = swr_convert(swr_ctx, frame->data, numFramesAvailable, inData, numFramesAvailable);
                 if (convRet < 0) {
                     std::cerr << "Audio: swr_convert error.\n";
+                } else {
+                    // Append converted samples into the accumulation buffers.
+                    for (int ch = 0; ch < numChannels; ch++) {
+                        float* channelData = reinterpret_cast<float*>(frame->data[ch]);
+                        audioAcc[ch].insert(audioAcc[ch].end(), channelData, channelData + convRet);
+                    }
                 }
             } else {
-                memcpy(frame->data[0], pData, dataSize);
-            }
-            
-            frame->pts = audioPts;
-            audioPts += frame->nb_samples;
-            
-            if (avcodec_send_frame(audioCodecCtx, frame) >= 0) {
-                while (avcodec_receive_packet(audioCodecCtx, packet) >= 0) {
-                    av_packet_rescale_ts(packet, audioCodecCtx->time_base, fmtCtx->streams[1]->time_base);
-                    packet->stream_index = 1;
-                    av_interleaved_write_frame(fmtCtx, packet);
-                    av_packet_unref(packet);
+                // If no conversion is needed.
+                for (int ch = 0; ch < numChannels; ch++) {
+                    // This example assumes the data is already in float format interleaved.
+                    // You may need to deinterleave if required.
+                    // For simplicity, we copy the raw data.
+                    float* channelData = reinterpret_cast<float*>(pData);
+                    audioAcc[ch].insert(audioAcc[ch].end(), channelData, channelData + numFramesAvailable);
                 }
             }
             av_frame_free(&frame);
@@ -400,8 +416,73 @@ void audioCaptureThread(AVFormatContext* fmtCtx, AVCodecContext* audioCodecCtx) 
             hr = pCaptureClient->GetNextPacketSize(&packetLength);
             if (FAILED(hr))
                 break;
+            
+            // While we have at least 1024 samples per channel, encode full frames.
+            while (!audioAcc.empty() && audioAcc[0].size() >= 1024) {
+                AVFrame* encFrame = av_frame_alloc();
+                encFrame->nb_samples = 1024;
+                encFrame->ch_layout = audioCodecCtx->ch_layout;
+                encFrame->format = audioCodecCtx->sample_fmt;
+                encFrame->sample_rate = audioCodecCtx->sample_rate;
+                if (av_frame_get_buffer(encFrame, 0) < 0) {
+                    std::cerr << "Audio: Could not allocate encoder frame buffer.\n";
+                    av_frame_free(&encFrame);
+                    break;
+                }
+                // Copy exactly 1024 samples from each channel.
+                for (int ch = 0; ch < numChannels; ch++) {
+                    memcpy(encFrame->data[ch], audioAcc[ch].data(), 1024 * sizeof(float));
+                    // Erase the used samples.
+                    audioAcc[ch].erase(audioAcc[ch].begin(), audioAcc[ch].begin() + 1024);
+                }
+                encFrame->pts = audioPts;
+                audioPts += 1024;
+                
+                if (avcodec_send_frame(audioCodecCtx, encFrame) >= 0) {
+                    while (avcodec_receive_packet(audioCodecCtx, packet) >= 0) {
+                        av_packet_rescale_ts(packet, audioCodecCtx->time_base, fmtCtx->streams[1]->time_base);
+                        packet->stream_index = 1;
+                        av_interleaved_write_frame(fmtCtx, packet);
+                        av_packet_unref(packet);
+                    }
+                }
+                av_frame_free(&encFrame);
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    
+    // At the end, if there are any remaining samples, pad with zeros to form one last frame.
+    if (!audioAcc.empty() && !audioAcc[0].empty()) {
+        size_t remaining = audioAcc[0].size();
+        size_t pad = 1024 - remaining;
+        for (int ch = 0; ch < numChannels; ch++) {
+            audioAcc[ch].resize(1024, 0.0f);
+        }
+        AVFrame* encFrame = av_frame_alloc();
+        encFrame->nb_samples = 1024;
+        encFrame->ch_layout = audioCodecCtx->ch_layout;
+        encFrame->format = audioCodecCtx->sample_fmt;
+        encFrame->sample_rate = audioCodecCtx->sample_rate;
+        if (av_frame_get_buffer(encFrame, 0) < 0) {
+            std::cerr << "Audio: Could not allocate final encoder frame buffer.\n";
+            av_frame_free(&encFrame);
+        } else {
+            for (int ch = 0; ch < numChannels; ch++) {
+                memcpy(encFrame->data[ch], audioAcc[ch].data(), 1024 * sizeof(float));
+            }
+            encFrame->pts = audioPts;
+            audioPts += 1024;
+            if (avcodec_send_frame(audioCodecCtx, encFrame) >= 0) {
+                while (avcodec_receive_packet(audioCodecCtx, packet) >= 0) {
+                    av_packet_rescale_ts(packet, audioCodecCtx->time_base, fmtCtx->streams[1]->time_base);
+                    packet->stream_index = 1;
+                    av_interleaved_write_frame(fmtCtx, packet);
+                    av_packet_unref(packet);
+                }
+            }
+            av_frame_free(&encFrame);
+        }
     }
     
     // Flush encoder.
@@ -499,24 +580,25 @@ void recordingThread(int width, int height) {
     
     // Video capture thread.
     std::thread captureThread([&]() {
+        const int targetFrameTimeMicro = 1000000 / 30;
         while (isRecording) {
-            uint8_t* buffer = new uint8_t[width * height * 4];
+            // Use vector for automatic memory management.
+            std::vector<uint8_t> buffer(width * height * 4);
             auto captureStart = std::chrono::high_resolution_clock::now();
-            if (!captureScreen(buffer, width, height)) {
+            if (!captureScreen(buffer.data(), width, height)) {
                 std::cerr << "Error capturing screen.\n";
-                delete[] buffer;
                 break;
             }
             auto captureEnd = std::chrono::high_resolution_clock::now();
             int64_t captureDuration = std::chrono::duration_cast<std::chrono::microseconds>(captureEnd - captureStart).count();
-            int64_t waitTime = (1000000 / 30) - captureDuration;
+            int64_t waitTime = targetFrameTimeMicro - captureDuration;
             if (waitTime > 0)
                 std::this_thread::sleep_for(std::chrono::microseconds(waitTime));
             auto currentTime = std::chrono::high_resolution_clock::now();
             int64_t elapsedTime = std::chrono::duration_cast<std::chrono::microseconds>(currentTime - startTime).count();
             
             CapturedFrame* capFrame = new CapturedFrame;
-            capFrame->data = buffer;
+            capFrame->data = std::move(buffer);
             capFrame->timestamp = elapsedTime;
             frameBuffer.push(capFrame);
         }
@@ -537,15 +619,16 @@ void recordingThread(int width, int height) {
             if (av_frame_get_buffer(frame, 32) < 0) {
                 std::cerr << "Error: Could not allocate video frame data.\n";
                 av_frame_free(&frame);
-                delete[] capFrame->data;
                 delete capFrame;
                 continue;
             }
-            frame->pts = av_rescale_q(capFrame->timestamp, {1, 1000000}, videoCodecCtx->time_base);
+
+frame->pts = av_rescale_q(capFrame->timestamp, {1, 1000000}, videoCodecCtx->time_base);
+//            frame->pts = av_rescale_q(capFrame->timestamp, {1, 1000000}, videoCodecCtx->time_base);
             SwsContext* swsContext = sws_getContext(width, height, AV_PIX_FMT_BGRA,
                                                     width, height, AV_PIX_FMT_YUV420P,
                                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-            uint8_t* srcSlice[1] = { capFrame->data };
+            uint8_t* srcSlice[1] = { capFrame->data.data() };
             int srcStride[1] = { 4 * width };
             sws_scale(swsContext, srcSlice, srcStride, 0, height, frame->data, frame->linesize);
             sws_freeContext(swsContext);
@@ -561,7 +644,6 @@ void recordingThread(int width, int height) {
             }
             av_packet_free(&packet);
             av_frame_free(&frame);
-            delete[] capFrame->data;
             delete capFrame;
         }
     });
@@ -650,3 +732,4 @@ int main() {
     UnhookWindowsHookEx(keyboardHook);
     return 0;
 }
+
