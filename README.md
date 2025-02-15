@@ -11,3 +11,7 @@ removed due to bugs - should have it fixed in a couple days
 
 
 i cant use these as my internet sux
+
+yeah - my stream key is in there ---  
+
+i guess i dont care -----   cant use  t=it   it anyway  ,,,   
