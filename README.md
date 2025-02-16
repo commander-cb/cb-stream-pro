@@ -1,3 +1,8 @@
+
+activation keys for some are " \ " or " u "   or auto start
+
+dev - there is ( can be ) problems with the \ and cross compilers .....   
+
 first try at a twitch streamer 
 
 
